@@ -27,26 +27,19 @@ const int ENA = 27, ENB = 14;
 
 // =============================================
 // --- UART2 (giao tiếp với Raspberry Pi) ---
-// RX2 = GPIO16, TX2 = GPIO17  ← KHÔNG xung đột bootloader
-// Pi TX (GPIO14) → ESP32 RX2 (GPIO16)
-// Pi RX (GPIO15) → ESP32 TX2 (GPIO17)
-// Protocol: "F,C,5\n" | "F,L,5\n" | "F,R,5\n" | "S,C,0\n"
 // =============================================
 #define PI_UART_BAUD 115200
 
 // =============================================
 // --- SERVO LÁI ---
-// Servo dùng Timer 3 riêng, LEDC motor dùng Timer 0,1
-// Tránh xung đột hoàn toàn
 // =============================================
-
 const int SERVO_PIN = 13;
-const int SERVO_CENTER = 68;  // thẳng (giữa 40-120)
+const int SERVO_CENTER = 68;  // thẳng
 const int SERVO_LEFT = 40;    // rẽ trái tối đa
 const int SERVO_RIGHT = 120;  // rẽ phải tối đa
 Servo steerServo;
 int currentServoAngle = SERVO_CENTER;
-int desiredServoAngle = SERVO_CENTER;  // chỉ write khi thực sự thay đổi
+int desiredServoAngle = SERVO_CENTER;
 
 // =============================================
 // --- ENCODER ---
@@ -57,37 +50,31 @@ volatile long encRightCount = 0;
 void IRAM_ATTR isrLeft() {
   bool A = digitalRead(ENC_L_A);
   bool B = digitalRead(ENC_L_B);
-  if (A == B) encLeftCount++;
-  else encLeftCount--;
+  if (A == B) encLeftCount++; else encLeftCount--;
 }
 void IRAM_ATTR isrLeftB() {
   bool A = digitalRead(ENC_L_A);
   bool B = digitalRead(ENC_L_B);
-  if (A != B) encLeftCount++;
-  else encLeftCount--;
+  if (A != B) encLeftCount++; else encLeftCount--;
 }
 void IRAM_ATTR isrRight() {
   bool A = digitalRead(ENC_R_A);
   bool B = digitalRead(ENC_R_B);
-  if (A == B) encRightCount++;
-  else encRightCount--;  // đảo dấu: tiến = dương
+  if (A == B) encRightCount++; else encRightCount--;
 }
 void IRAM_ATTR isrRightB() {
   bool A = digitalRead(ENC_R_A);
   bool B = digitalRead(ENC_R_B);
-  if (A != B) encRightCount++;
-  else encRightCount--;  // đảo dấu
+  if (A != B) encRightCount++; else encRightCount--;
 }
 
 // =============================================
 // --- PID + FEEDFORWARD ---
-// Kp/Ki tăng để bù lệch nhanh hơn
-// FF_BASE giảm để xe chạy chậm, dễ kiểm soát
 // =============================================
-float Kp = 1.2;            // Bù lệch nhanh
-float Ki = 0.08;           // Tích lũy bù lệch
-const int FF_BASE = 150;   // PWM cơ sở đủ mạnh để xe chạy
-const int MAX_SPEED = 30;  // encoder ticks/50ms
+float Kp = 1.2;
+float Ki = 0.08;           
+const int FF_BASE = 100;
+const int MAX_SPEED = 30;
 
 int targetSpeedLeft = 0;
 int targetSpeedRight = 0;
@@ -100,12 +87,10 @@ long prevEncRight = 0;
 unsigned long prevTime = 0;
 unsigned long lastReport = 0;
 unsigned long lastCommandTime = 0;
-const unsigned long COMMAND_TIMEOUT_MS = 10000; // 10s
+const unsigned long COMMAND_TIMEOUT_MS = 10000;
 
 // =============================================
 // --- ĐIỀU KHIỂN MOTOR ---
-// Chỉ dùng ledcWrite cho ENA/ENB
-// KHÔNG đụng vào bất kỳ hàm servo nào ở đây
 // =============================================
 void applyMotorPWM(int pL, int pR) {
   if (pL > 0) {
@@ -119,7 +104,7 @@ void applyMotorPWM(int pL, int pR) {
     digitalWrite(IN2, LOW);
   }
   ledcWrite(ENA, constrain(abs(pL), 0, 255));
-
+  
   if (pR > 0) {
     digitalWrite(IN3, LOW);
     digitalWrite(IN4, HIGH);
@@ -152,49 +137,57 @@ void markCommandSeen() {
 void computePID() {
   unsigned long now = millis();
   if (now - prevTime < 50) return;
-
+  
   long deltaL = encLeftCount  - prevEncLeft;
   long deltaR = encRightCount - prevEncRight;
   prevEncLeft  = encLeftCount;
   prevEncRight = encRightCount;
-
+  
   if (targetSpeedLeft == 0 && targetSpeedRight == 0) {
     hardStop();
     prevTime = now;
     return;
   }
 
-  int dir = (targetSpeedLeft > 0) ? 1 : -1;
-
-  // Nếu encoder không có tín hiệu (chưa kết nối) → open-loop thuần
-  // nhân abs(target) vào [FF_BASE, 255]
+  // Tách biệt hướng quay 2 bánh để an toàn khi vô cua gắt
+  int dirL = (targetSpeedLeft > 0) ? 1 : (targetSpeedLeft < 0 ? -1 : 0);
+  int dirR = (targetSpeedRight > 0) ? 1 : (targetSpeedRight < 0 ? -1 : 0);
+  
   bool encDead = (deltaL == 0 && deltaR == 0);
-
+  
   if (encDead) {
-    int rawPWM = map(abs(targetSpeedLeft), 0, MAX_SPEED, FF_BASE, 255);
-    rawPWM     = constrain(rawPWM, FF_BASE, 255);
-    pwmLeft    = dir * rawPWM;
-    pwmRight   = dir * rawPWM;
+    int rawPwmLeft = map(abs(targetSpeedLeft), 0, MAX_SPEED, FF_BASE, 255);
+    int rawPwmRight = map(abs(targetSpeedRight), 0, MAX_SPEED, FF_BASE, 255);
+    
+    // An toàn tuyệt đối: Target = 0 thì ngắt điện PWM
+    if (targetSpeedLeft == 0) rawPwmLeft = 0;
+    if (targetSpeedRight == 0) rawPwmRight = 0;
+    
+    pwmLeft  = dirL * constrain(rawPwmLeft, 0, 255);
+    pwmRight = dirR * constrain(rawPwmRight, 0, 255);
   } else {
     float errL = targetSpeedLeft  - deltaL;
     float errR = targetSpeedRight - deltaR;
     integralLeft  = constrain(integralLeft  + errL, -200, 200);
     integralRight = constrain(integralRight + errR, -200, 200);
 
-    // Ánh xạ tốc độ mục tiêu thành PWM cơ sở động (Dynamic Feedforward)
-    // Giả sử PWM = 60 là mức điện áp tối thiểu để bánh bắt đầu lăn
-    int basePwmLeft = map(abs(targetSpeedLeft), 0, MAX_SPEED, 60, 255);
-    int basePwmRight = map(abs(targetSpeedRight), 0, MAX_SPEED, 60, 255);
+    // Dynamic Feedforward kết hợp với FF_BASE mạnh mẽ
+    int basePwmLeft = map(abs(targetSpeedLeft), 0, MAX_SPEED, FF_BASE, 255);
+    int basePwmRight = map(abs(targetSpeedRight), 0, MAX_SPEED, FF_BASE, 255);
+    
     if (targetSpeedLeft == 0) basePwmLeft = 0;
     if (targetSpeedRight == 0) basePwmRight = 0;
 
-    pwmLeft  = constrain(dir * basePwmLeft + (int)(Kp * errL + Ki * integralLeft),  -255, 255);
-    pwmRight = constrain(dir * basePwmRight + (int)(Kp * errR + Ki * integralRight), -255, 255);
+    pwmLeft  = constrain(dirL * basePwmLeft + (int)(Kp * errL + Ki * integralLeft),  -255, 255);
+    pwmRight = constrain(dirR * basePwmRight + (int)(Kp * errR + Ki * integralRight), -255, 255);
   }
 
+  applyMotorPWM(pwmLeft, pwmRight);
+  prevTime = now;
+}
+
 // =============================================
-// --- SERVO: chỉ write khi góc thực sự thay đổi
-// Tách hoàn toàn khỏi vòng PID motor
+// --- SERVO ---
 // =============================================
 void updateServo() {
   if (desiredServoAngle != currentServoAngle) {
@@ -204,8 +197,7 @@ void updateServo() {
 }
 
 // =============================================
-// --- HÀM ĐIỀU KHIỂN XE ---
-// KHÔNG gọi servo ở đây — tách biệt hoàn toàn
+// --- HÀM ĐIỀU KHIỂN XE TÁCH BIỆT TRÁI/PHẢI ---
 // =============================================
 void carForward(int spdL, int spdR) {
   if (targetSpeedLeft <= 0) {
@@ -229,77 +221,58 @@ void carBackward(int spdL, int spdR) {
   markCommandSeen();
 }
 
-// Servo chỉ đặt desired — updateServo() trong loop mới write
-void steerCenter() {
-  desiredServoAngle = SERVO_CENTER;
+void carStop() {
   markCommandSeen();
+  hardStop();
 }
-void steerLeft() {
-  desiredServoAngle = SERVO_LEFT;
-  markCommandSeen();
-}
-void steerRight() {
-  desiredServoAngle = SERVO_RIGHT;
-  markCommandSeen();
-}
+
+void steerCenter() { desiredServoAngle = SERVO_CENTER; markCommandSeen(); }
+void steerLeft() { desiredServoAngle = SERVO_LEFT; markCommandSeen(); }
+void steerRight() { desiredServoAngle = SERVO_RIGHT; markCommandSeen(); }
 
 // =============================================
 // --- UART: nhận lệnh từ Raspberry Pi ---
-// Format: "<DRIVE>,<steer_val>,<SPEED>\n"
-//   DRIVE    : F(forward) | B(backward) | S(stop)
-//   steer_val: số nguyên -100 (full trái) … 0 (thẳng) … +100 (full phải)
-//   SPEED    : số nguyên 1-8
-// Ví dụ: "F,-45,5\n"  "F,0,5\n"  "F,72,4\n"  "S,0,0\n"
-//
-// Ánh xạ steer_val → góc servo:
-//   steer_val = -100 → SERVO_LEFT  (góc nhỏ nhất)
-//   steer_val =    0 → SERVO_CENTER
-//   steer_val = +100 → SERVO_RIGHT (góc lớn nhất)
-//   Dùng nội suy tuyến tính 2 vế vì servo không đối xứng (62-50=12, 90-62=28)
 // =============================================
 void handleUART() {
   if (!Serial2.available()) return;
-
   String line = Serial2.readStringUntil('\n');
   line.trim();
   if (line.length() < 5) return;
 
   int c1 = line.indexOf(',');
   int c2 = line.lastIndexOf(',');
-  if (c1 < 0 || c2 == c1) return;  // format sai
+  if (c1 < 0 || c2 == c1) return;
 
   char drive = (char)line.charAt(0);
-  int steerVal = line.substring(c1 + 1, c2).toInt();  // -100 … +100
+  int steerVal = line.substring(c1 + 1, c2).toInt();  
   int spd = line.substring(c2 + 1).toInt();
+  
+  // KIỂM TRA ĐẶC BIỆT: Nếu Pi muốn dừng (Tốc độ = 0)
+  if (spd == 0 && (drive == 'F' || drive == 'B')) {
+      drive = 'S';
+  }
 
-  // --- Ánh xạ steer_val → góc servo bằng nội suy tuyến tính ---
   steerVal = constrain(steerVal, -100, 100);
   int targetAngle;
   if (steerVal <= 0) {
-    // [-100, 0] → [SERVO_LEFT, SERVO_CENTER]
     targetAngle = SERVO_CENTER + steerVal * (SERVO_CENTER - SERVO_LEFT) / 100;
   } else {
-    // [0, +100] → [SERVO_CENTER, SERVO_RIGHT]
     targetAngle = SERVO_CENTER + steerVal * (SERVO_RIGHT - SERVO_CENTER) / 100;
   }
   desiredServoAngle = constrain(targetAngle, SERVO_LEFT, SERVO_RIGHT);
   markCommandSeen();
 
   // --- Vi sai điện tử (Electronic Differential) ---
-  // Giảm tốc bánh bên trong góc cua để xe không bị ghì
-  float diffFactor = 0.55; // Độ giảm (0.55 = giảm tối đa 55% tốc độ bánh trong)
+  float diffFactor = 0.55; 
   int spdL = spd;
   int spdR = spd;
 
   if (steerVal < 0) {
-      // Cua trái -> Bánh trái nằm bên trong
       spdL = spd - (spd * (abs(steerVal) / 100.0) * diffFactor);
   } else if (steerVal > 0) {
-      // Cua phải -> Bánh phải nằm bên trong
       spdR = spd - (spd * (steerVal / 100.0) * diffFactor);
   }
 
-  // --- Áp dụng drive ---
   switch (drive) {
     case 'F': carForward(constrain(spdL, 1, MAX_SPEED), constrain(spdR, 1, MAX_SPEED)); break;
     case 'B': carBackward(constrain(spdL, 1, MAX_SPEED), constrain(spdR, 1, MAX_SPEED)); break;
@@ -311,34 +284,23 @@ void handleUART() {
 // =============================================
 // --- WEB HANDLERS ---
 // =============================================
-
 void handleForward() {
   int spd = server.hasArg("spd") ? server.arg("spd").toInt() : 15;
-  carForward(constrain(spd, 1, MAX_SPEED));
+  int s = constrain(spd, 1, MAX_SPEED);
+  carForward(s, s);
   server.send(200, "text/plain", "OK");
 }
 void handleBackward() {
   int spd = server.hasArg("spd") ? server.arg("spd").toInt() : 15;
-  carBackward(constrain(spd, 1, MAX_SPEED));
+  int s = constrain(spd, 1, MAX_SPEED);
+  carBackward(s, s);
   server.send(200, "text/plain", "OK");
 }
 void handleKeepalive() { markCommandSeen(); server.send(200, "text/plain", "OK"); }
-void handleStop() {
-  carStop();
-  server.send(200, "text/plain", "OK");
-}
-void handleSteerLeft() {
-  steerLeft();
-  server.send(200, "text/plain", "OK");
-}
-void handleSteerRight() {
-  steerRight();
-  server.send(200, "text/plain", "OK");
-}
-void handleSteerCenter() {
-  steerCenter();
-  server.send(200, "text/plain", "OK");
-}
+void handleStop() { carStop(); server.send(200, "text/plain", "OK"); }
+void handleSteerLeft() { steerLeft(); server.send(200, "text/plain", "OK"); }
+void handleSteerRight() { steerRight(); server.send(200, "text/plain", "OK"); }
+void handleSteerCenter() { steerCenter(); server.send(200, "text/plain", "OK"); }
 void handleSteerAngle() {
   if (server.hasArg("v")) {
     int angle = constrain(server.arg("v").toInt(), SERVO_LEFT, SERVO_RIGHT);
@@ -347,7 +309,6 @@ void handleSteerAngle() {
   }
   server.send(200, "text/plain", "OK");
 }
-
 void handleTelemetry() {
   char json[200];
   snprintf(json, sizeof(json),
@@ -358,7 +319,7 @@ void handleTelemetry() {
 }
 
 // =============================================
-// --- TRANG WEB ---
+// --- TRANG WEB HTML ---
 // =============================================
 const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
@@ -476,11 +437,10 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     driveActive=true;
     const driveUrl=(dir==='fwd')?'/forward?spd='+spd():'/backward?spd='+spd();
     cmd(driveUrl);
-    // keepalive để giữ lệnh, KHÔNG reset encoder
     timer=setInterval(()=>{ if(driveActive) cmd('/keepalive'); },400);
   }
   function release(){
-    if(!driveActive) return;  // bỏ qua nếu nút drive không đang giữ
+    if(!driveActive) return;
     driveActive=false;
     clearInterval(timer);
     timer=null;
@@ -498,7 +458,6 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   }
   function steerRelease(){clearInterval(steerTimer);steerTimer=null;}
   function steerGoCenter(){steerAngle=STEER_CTR;cmd('/steer/center');}
-  // Chỉ dừng khi rời tab/app, KHÔNG dừng khi thả nút lái
   window.addEventListener('blur', ()=>{release();steerRelease();});
   document.addEventListener('visibilitychange', ()=>{ if(document.hidden){release();steerRelease();} });
   async function poll(){
@@ -531,38 +490,29 @@ void handleRoot() {
 void setup() {
   Serial.begin(115200);
 
-  // Motor pins
-  pinMode(IN1, OUTPUT);
-  pinMode(IN2, OUTPUT);
-  pinMode(IN3, OUTPUT);
-  pinMode(IN4, OUTPUT);
+  pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
 
-  // LEDC cho motor — chỉ định rõ timer 0 và 1 để KHÔNG đụng timer 3 của servo
   ledcAttach(ENA, 5000, 8);
   ledcAttach(ENB, 5000, 8);
   applyMotorPWM(0, 0);
 
-  // Encoder
-  pinMode(ENC_L_A, INPUT_PULLUP);
-  pinMode(ENC_L_B, INPUT_PULLUP);
-  pinMode(ENC_R_A, INPUT_PULLUP);
-  pinMode(ENC_R_B, INPUT_PULLUP);
+  pinMode(ENC_L_A, INPUT_PULLUP); pinMode(ENC_L_B, INPUT_PULLUP);
+  pinMode(ENC_R_A, INPUT_PULLUP); pinMode(ENC_R_B, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(ENC_L_A), isrLeft, CHANGE);
   attachInterrupt(digitalPinToInterrupt(ENC_L_B), isrLeftB, CHANGE);
   attachInterrupt(digitalPinToInterrupt(ENC_R_A), isrRight, CHANGE);
   attachInterrupt(digitalPinToInterrupt(ENC_R_B), isrRightB, CHANGE);
 
-  // Servo — allocate timer 3 riêng biệt, KHÔNG dùng timer 0/1/2
-  // Thứ tự quan trọng: allocate timer TRƯỚC KHI ledcAttach motor
-  ESP32PWM::allocateTimer(3);  // ← Timer 3 riêng cho servo
+  ESP32PWM::allocateTimer(3);
   steerServo.setPeriodHertz(50);
-  steerServo.attach(SERVO_PIN);  // default pulse range, đúng với góc đã test
+  steerServo.attach(SERVO_PIN);
   delay(200);
   steerServo.write(SERVO_CENTER);
-  delay(300);  // chờ servo về vị trí trước khi tiếp tục
+  delay(300);
+  
   lastCommandTime = millis();
 
-  // WiFi
   Serial.printf("Ket noi: %s\n", ssid);
   WiFi.begin(ssid, password);
   while (WiFi.status() != WL_CONNECTED) {
@@ -571,7 +521,6 @@ void setup() {
   }
   Serial.printf("\nIP: http://%s\n", WiFi.localIP().toString().c_str());
 
-  // Web routes
   server.on("/", handleRoot);
   server.on("/forward", handleForward);
   server.on("/backward", handleBackward);
@@ -584,10 +533,9 @@ void setup() {
   server.begin();
   Serial.println("Server started!");
 
-  // UART2: nhận lệnh từ Raspberry Pi qua GPIO16(RX2)/GPIO17(TX2)
-  // Dùng GPIO16/17 → KHÔNG đụng GPIO3/1 (bootloader) → nạp code an toàn
-  Serial2.begin(PI_UART_BAUD, SERIAL_8N1, 16, 17);  // RX=GPIO16, TX=GPIO17
-  Serial2.setTimeout(10);
+  // UART2 với Timeout được giới hạn an toàn 20ms
+  Serial2.begin(PI_UART_BAUD, SERIAL_8N1, 16, 17);
+  Serial2.setTimeout(20);
   Serial.println("UART2 ready (RX=GPIO3/RX0, TX=GPIO1/TX0) - waiting for Pi commands...");
 }
 
@@ -596,9 +544,9 @@ void setup() {
 // =============================================
 void loop() {
   server.handleClient();
-  handleUART();  // nhận lệnh từ Raspberry Pi qua Serial2
+  handleUART();
   computePID();
-  updateServo();  // ← servo chỉ write tại đây, tách khỏi PID và web handler
+  updateServo();
 
   if ((targetSpeedLeft != 0 || targetSpeedRight != 0) && millis() - lastCommandTime > COMMAND_TIMEOUT_MS) {
     hardStop();
