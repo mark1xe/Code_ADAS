@@ -1,0 +1,11 @@
+names:
+- stop_sign
+- no_entry
+- red_light
+- yellow_light
+- green_light
+- person
+nc: 6
+path: /kaggle/working/dataset
+train: images/train
+val: images/val
