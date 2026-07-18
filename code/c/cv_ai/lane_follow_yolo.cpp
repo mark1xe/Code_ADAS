@@ -7,13 +7,19 @@
 //    - GREEN / YELLOW / NORMAL : chạy bình thường.
 //    - Lái LUÔN bám làn (kể cả lúc dừng) -> resume là đi đúng hướng.
 //
-//  Giao thức UART: "F,<steer>,<speed>\n" / "S,0,0\n"
+//  Giao thức UART:
+//    Pi -> ESP32 : "F,<steer>,<speed>\n" / "S,0,0\n"
+//    ESP32 -> Pi : "T,<encLeft>,<encRight>,<t_ms_esp32>\n"  (telemetry, ~10Hz, xem main.c)
+//
+//  Log CSV (1 dòng/khung hình, phục vụ đánh giá định lượng — mục 2/5/6 luận văn):
+//    frame,t_ms,fps_vision,fps_capture,fps_yolo,latency_compute_ms,lane_found,off,
+//    nbands,steer,spd,no_lane,scenario,force_stop,on_zebra,enc_left,enc_right,enc_t_ms
 //
 //  Build:
 //    g++ -O3 -std=c++17 lane_follow_yolo.cpp -o lane_follow_yolo \
 //        `pkg-config --cflags --libs opencv4` -lpthread
 //  Chạy:
-//    libcamerify ./lane_follow_yolo [đường_dẫn_model.onnx]
+//    libcamerify ./lane_follow_yolo [đường_dẫn_model.onnx] [đường_dẫn_log.csv]
 //    Phím: a=chạy  s=dừng  c=chụp  q=thoát
 // =============================================================
 #include <iostream>
@@ -33,6 +39,8 @@
 #include <csignal>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <fstream>
+#include <iomanip>
 #include <opencv2/opencv.hpp>
 
 using namespace std;
@@ -80,6 +88,7 @@ constexpr float SPEED_STEP   = 1.0f;
 constexpr int   DRIVE_SPEED  = 8;
 constexpr int   CURVE_SPEED  = 5;
 constexpr int   SLOW_SPEED   = 5;
+constexpr bool  ENABLE_CURVE_SPEED = false;
 constexpr int   NO_LANE_STOP = 30;
 
 // ============================================================
@@ -94,23 +103,23 @@ constexpr int   YOLO_NUM_CLASS = 6;
 string YOLO_MODEL_PATH = "/home/leanhquan/export/best.onnx";
 
 // Diện tích khung tối thiểu (px^2) để coi đối tượng đủ GẦN -> mới phản ứng
-constexpr int   MIN_BOX_AREA   = 200;   // bắt biển/đèn TỪ XA -> kịp dừng trước khi tới (thà dừng xa còn hơn vượt)
-// Ngưỡng "phiếu" để xác nhận có vật cần DỪNG (chống chớp nhoáng mà vẫn bắt được đèn chập chờn)
+constexpr int   MIN_BOX_AREA   = 200;   // bắt biển/đèn TỪ XA -> kịp dừng trước khi tới 
+// Ngưỡng "phiếu" để xác nhận có vật cần DỪNG 
 constexpr int   YOLO_STOP_VOTES = 2;
 // Đèn đỏ: đã thấy đỏ thì CHỐT dừng và giữ; tự nhả sau ngần này (ms) nếu không thấy xanh (an toàn)
 constexpr int   RED_LATCH_TIMEOUT_MS = 8000;
 
 // --- Vạch người đi bộ (zebra): các sọc trắng ngang đều nhau ---
-constexpr float ZEBRA_ROI_X0 = 0.25f, ZEBRA_ROI_X1 = 0.75f;   // chỉ xét dải giữa
-constexpr float ZEBRA_ROI_Y0 = 0.50f, ZEBRA_ROI_Y1 = 0.92f;   // nửa dưới khung
-constexpr int   ZEBRA_MIN_STRIPES   = 3;      // tối thiểu 3 sọc mới coi là vạch
-constexpr float ZEBRA_STRIPE_ASPECT = 1.8f;   // sọc phải NẰM NGANG (rộng/cao >= 1.8)
-constexpr float ZEBRA_MIN_AREA      = 200.0f; // diện tích sọc tối thiểu
-constexpr float ZEBRA_GAP_STD_MAX   = 8.0f;   // khoảng cách giữa các sọc phải ĐỀU
-constexpr int   ZEBRA_CONFIRM       = 2;      // số khung liên tiếp để xác nhận (chống báo nhầm)
-constexpr int   ZEBRA_HOLD_FRAMES   = 40;     // giữ chế độ "đi thẳng qua vạch" trong N khung
-constexpr int   ZEBRA_SPEED         = 5;      // bò chậm khi qua vạch
-constexpr bool  ENABLE_ZEBRA        = false;  // TẮT zebra (đang báo nhầm vạch làn -> ép đi thẳng -> lạc làn). Bật lại khi đã chỉnh chuẩn
+constexpr float ZEBRA_ROI_X0 = 0.25f, ZEBRA_ROI_X1 = 0.75f;   
+constexpr float ZEBRA_ROI_Y0 = 0.50f, ZEBRA_ROI_Y1 = 0.92f;   
+constexpr int   ZEBRA_MIN_STRIPES   = 3;     
+constexpr float ZEBRA_STRIPE_ASPECT = 1.8f;  
+constexpr float ZEBRA_MIN_AREA      = 200.0f; 
+constexpr float ZEBRA_GAP_STD_MAX   = 8.0f;  
+constexpr int   ZEBRA_CONFIRM       = 2;      
+constexpr int   ZEBRA_HOLD_FRAMES   = 40;     
+constexpr int   ZEBRA_SPEED         = 5;      
+constexpr bool  ENABLE_ZEBRA        = false;  
 
 const vector<string> CLASS_NAMES = {
     "stop_sign", "no_entry", "red_light",
@@ -134,6 +143,7 @@ atomic<bool> shared_running(false);
 atomic<bool> app_exit(false);
 
 Mat   cap_frame;  mutex cap_mtx;  bool cap_ready = false;
+int64_t cap_frame_us = 0;                              
 int   uart_fd = -1;
 Mat   stream_frame;  mutex stream_mtx;
 
@@ -141,6 +151,29 @@ Mat   stream_frame;  mutex stream_mtx;
 Mat   yolo_input_frame;  mutex yolo_in_mtx;  condition_variable yolo_in_cv;  bool yolo_in_ready = false;
 // YOLO: đầu ra (yolo thread -> main)
 vector<YoloDetection> yolo_last_dets;  Scenario yolo_last_sc = Scenario::NORMAL;  mutex yolo_out_mtx;
+
+// ============================================================
+//  ĐO LƯỜNG ĐỊNH LƯỢNG 
+// ============================================================
+atomic<float> g_fps_capture(0.0f);
+atomic<float> g_fps_yolo(0.0f);
+
+atomic<int32_t> g_enc_left(-1), g_enc_right(-1);
+atomic<int64_t> g_enc_t_ms(-1);        
+atomic<int64_t> g_enc_recv_us(0);      
+
+
+ofstream g_log;
+long     g_log_frame_idx = 0;
+chrono::steady_clock::time_point g_program_start;
+
+static inline int64_t now_us() {
+    return chrono::duration_cast<chrono::microseconds>(chrono::steady_clock::now().time_since_epoch()).count();
+}
+string default_log_name() {
+    time_t rt; time(&rt); char tb[32]; strftime(tb, sizeof(tb), "%Y%m%d_%H%M%S", localtime(&rt));
+    return string("log_") + tb + ".csv";
+}
 
 // ============================================================
 //  MJPEG SERVER
@@ -210,6 +243,32 @@ void uart_thread_func() {
     }
 }
 
+// Luồng RIÊNG chỉ để đọc telemetry encoder ESP32 gửi về khung "T,<encL>,<encR>,<t_ms>\n"
+void uart_rx_thread_func() {
+    string line; line.reserve(64);
+    while (!app_exit) {
+        if (uart_fd < 0) { this_thread::sleep_for(chrono::milliseconds(100)); continue; }
+        char c;
+        int n = read(uart_fd, &c, 1);
+        if (n <= 0) continue;  
+        if (c == '\n') {
+            if (!line.empty() && line[0] == 'T') {
+                long eL = 0, eR = 0; long long tms = 0;
+                if (sscanf(line.c_str(), "T,%ld,%ld,%lld", &eL, &eR, &tms) == 3) {
+                    g_enc_left.store((int32_t)eL, memory_order_relaxed);
+                    g_enc_right.store((int32_t)eR, memory_order_relaxed);
+                    g_enc_t_ms.store((int64_t)tms, memory_order_relaxed);
+                    g_enc_recv_us.store(now_us(), memory_order_relaxed);
+                }
+            }
+            line.clear();
+        } else if (c != '\r') {
+            if (line.size() < 63) line.push_back(c);
+            else line.clear();   
+        }
+    }
+}
+
 // ============================================================
 //  CAMERA
 // ============================================================
@@ -218,16 +277,22 @@ void capture_thread_func() {
     if (!cap.isOpened()) { cerr << "[CAM] Không mở được camera!\n"; app_exit = true; return; }
     cap.set(CAP_PROP_FRAME_WIDTH, 640); cap.set(CAP_PROP_FRAME_HEIGHT, 480); cap.set(CAP_PROP_FPS, 30);
     Mat tmp;
+    int cnt = 0; auto t0 = chrono::steady_clock::now();
     while (!app_exit) {
         if (!cap.read(tmp) || tmp.empty()) { this_thread::sleep_for(chrono::milliseconds(5)); continue; }
         if (tmp.cols != CAM_W || tmp.rows != CAM_H) resize(tmp, tmp, Size(CAM_W, CAM_H), 0, 0, INTER_LINEAR);
-        { lock_guard<mutex> lk(cap_mtx); tmp.copyTo(cap_frame); cap_ready = true; }
+        int64_t t_us = now_us();
+        { lock_guard<mutex> lk(cap_mtx); tmp.copyTo(cap_frame); cap_frame_us = t_us; cap_ready = true; }
+        cnt++;
+        auto now = chrono::steady_clock::now();
+        chrono::duration<float> dt = now - t0;
+        if (dt.count() >= 1.0f) { g_fps_capture.store(cnt / dt.count(), memory_order_relaxed); cnt = 0; t0 = now; }
     }
     cap.release();
 }
 
 // ============================================================
-//  MẶT NẠ VẠCH (adaptive threshold)  
+//  MẶT NẠ VẠCH 
 // ============================================================
 Mat compute_mask(const Mat& bgr) {
     Mat gray, blur, white, floor, mask;
@@ -265,7 +330,7 @@ static bool window_centroid(const Mat& mask, int xc, int margin, int y0, int y1,
     out_x = float(sum / cnt); return true;
 }
 
-struct LaneResult { bool found = false; float offset = 0.0f; int nbands = 0; };
+struct LaneResult { bool found = false; float offset = 0.0f; int nbands = 0; float curve = 0.0f; };
 
 LaneResult detect_lane(const Mat& bgr, const Mat& mask, Mat& dbg) {
     LaneResult res;
@@ -325,21 +390,18 @@ LaneResult detect_lane(const Mat& bgr, const Mat& mask, Mat& dbg) {
         if (n > 0) { inner_x /= n; lane_center = lane_center + INNER_BIAS * (inner_x - lane_center); }
     }
 
-    // --- CHỈ THẤY 1 VẠCH (hay gặp ở cua: vạch ngoài khuất) -> ÔM SÁT MÉP TRONG ---
-    // Xác định cua trái/phải bằng ĐỘ NGHIÊNG của vạch (gần->xa), KHÔNG dựa nửa ảnh
-    // -> không bị nhầm "mép nào" kể cả khi vào cua ngược.
     int nL = (int)lefts.size(), nR = (int)rights.size();
     if ((nL >= MIN_BANDS && nR == 0) || (nR >= MIN_BANDS && nL == 0)) {
         const vector<float>& ln = (nL > 0) ? lefts : rights;
-        float near_x = ln.front();              // dải đáy (gần xe)
-        float far_x  = ln.back();               // dải trên (xa)
-        float lean   = far_x - near_x;          // <0: nghiêng TRÁI -> cua trái; >0: cua phải
+        float near_x = ln.front();             
+        float far_x  = ln.back();              
+        float lean   = far_x - near_x;          
         float line_mean = 0; for (float v : ln) line_mean += v; line_mean /= ln.size();
         float dir, dist;
-        if (fabsf(lean) > LEAN_TH) {            // ĐANG CUA -> ôm sát mép trong (vạch thấy = mép trong)
-            dir  = (lean < 0) ? +1.0f : -1.0f;  // cua trái: tâm bên PHẢI vạch; cua phải: bên TRÁI
-            dist = HUG_LANE * W;                // ôm sát: gần vạch hơn -> cua gắt hơn
-        } else {                                // gần THẲNG: giữ giữa làn như cũ, theo phía thấy vạch
+        if (fabsf(lean) > LEAN_TH) {            
+            dir  = (lean < 0) ? +1.0f : -1.0f; 
+            dist = HUG_LANE * W;                
+        } else {                                
             dir  = (nL > 0) ? +1.0f : -1.0f;
             dist = half_lane_px;
         }
@@ -348,7 +410,7 @@ LaneResult detect_lane(const Mat& bgr, const Mat& mask, Mat& dbg) {
 
     float offset = (lane_center - cx) / cx;
     offset = max(-1.0f, min(1.0f, offset));
-    res.found = true; res.offset = offset;
+    res.found = true; res.offset = offset; res.curve = curve;
     line(dbg, Point(int(lane_center), y0), Point(int(lane_center), H - 1), Scalar(0, 255, 255), 2);
     line(dbg, Point(int(cx), y0), Point(int(cx), H - 1), Scalar(180, 180, 180), 1);
     char tag[48]; snprintf(tag, sizeof(tag), "off=%+.3f bands=%d", offset, res.nbands);
@@ -368,9 +430,7 @@ int offset_to_steer(float offset) {
 }
 
 // ============================================================
-//  PHÁT HIỆN VẠCH NGƯỜI ĐI BỘ (zebra)
-//  Các sọc TRẮNG NẰM NGANG, đều nhau -> đếm sọc + kiểm tra khoảng cách đều.
-//  Chạy trên chính mask làn (sọc nằm trên đường nên sống sót qua lọc nền).
+//  PHÁT HIỆN VẠCH NGƯỜI ĐI BỘ 
 // ============================================================
 bool detect_zebra(const Mat& mask) {
     int W = mask.cols, H = mask.rows;
@@ -389,9 +449,9 @@ bool detect_zebra(const Mat& mask) {
     for (const auto& cnt : contours) {
         if (contourArea(cnt) < ZEBRA_MIN_AREA) continue;
         Rect bb = boundingRect(cnt);
-        if ((float)bb.width / max(bb.height, 1) < ZEBRA_STRIPE_ASPECT) continue;  // phải nằm ngang
+        if ((float)bb.width / max(bb.height, 1) < ZEBRA_STRIPE_ASPECT) continue;  
         if (bb.height < 5) continue;
-        if (bb.x <= 2 || (bb.x + bb.width) >= rw - 2) continue;                   // bỏ sọc dính mép (có thể là vạch làn)
+        if (bb.x <= 2 || (bb.x + bb.width) >= rw - 2) continue;                   
         stripe_cy.push_back(bb.y + bb.height / 2.0f);
     }
     if ((int)stripe_cy.size() < ZEBRA_MIN_STRIPES) return false;
@@ -402,7 +462,7 @@ bool detect_zebra(const Mat& mask) {
     float mg = 0; for (float g : gaps) mg += g; mg /= gaps.size();
     if (mg < 4.0f) return false;
     float var = 0; for (float g : gaps) var += (g - mg) * (g - mg);
-    if (sqrtf(var / gaps.size()) > ZEBRA_GAP_STD_MAX) return false;   // khoảng cách phải ĐỀU
+    if (sqrtf(var / gaps.size()) > ZEBRA_GAP_STD_MAX) return false;  
     return true;
 }
 
@@ -479,7 +539,7 @@ void draw_detections(Mat& dbg, const vector<YoloDetection>& dets) {
 Scenario determine_scenario(const vector<YoloDetection>& dets) {
     bool no_entry=false, stop=false, red=false, yellow=false, green=false, person=false;
     for (const auto& d : dets) {
-        if (d.box.area() < MIN_BOX_AREA) continue;     // chỉ phản ứng khi đối tượng đủ GẦN
+        if (d.box.area() < MIN_BOX_AREA) continue;     
         switch (d.class_id) {
             case 0: stop=true; break; case 1: no_entry=true; break; case 2: red=true; break;
             case 3: yellow=true; break; case 4: green=true; break; case 5: person=true; break;
@@ -505,8 +565,9 @@ const char* scenario_name(Scenario s) {
     }
 }
 
-// YOLO THREAD: xử lý KHUNG MỚI NHẤT, không chặn vòng lái
+// YOLO THREAD: 
 void yolo_thread_func() {
+    int cnt = 0; auto t0 = chrono::steady_clock::now();
     while (!app_exit) {
         Mat frame;
         {
@@ -520,8 +581,7 @@ void yolo_thread_func() {
         if (frame.empty()) continue;
         auto dets = run_yolo(frame);
         Scenario sc = determine_scenario(dets);
-        // CHỐNG CHỚP NHOÁNG bằng "phiếu": thấy vật cần dừng -> +1 phiếu, không thấy -> -1.
-        // Đủ ngưỡng phiếu mới DỪNG -> chớp 1 khung lẻ không kích, nhưng đèn chập chờn vẫn bắt được.
+       
         bool is_stop  = (sc == Scenario::RED_LIGHT || sc == Scenario::NO_ENTRY ||
                          sc == Scenario::PERSON_AHEAD || sc == Scenario::STOP_SIGN);
         bool is_green = (sc == Scenario::GREEN_LIGHT);
@@ -531,11 +591,16 @@ void yolo_thread_func() {
         if (is_green) { green_votes = min(green_votes + 1, 4); }
         else          { green_votes = max(green_votes - 1, 0); }
         Scenario stable_sc;
-        if      (stop_votes  >= YOLO_STOP_VOTES) stable_sc = last_stop;            // dừng đã xác nhận
-        else if (green_votes >= YOLO_STOP_VOTES) stable_sc = Scenario::GREEN_LIGHT; // XANH đã xác nhận -> mới nhả chốt
-        else                                     stable_sc = Scenario::NORMAL;      // chưa chắc -> không nhả chốt
+        if      (stop_votes  >= YOLO_STOP_VOTES) stable_sc = last_stop;            
+        else if (green_votes >= YOLO_STOP_VOTES) stable_sc = Scenario::GREEN_LIGHT; 
+        else                                     stable_sc = Scenario::NORMAL;      
         { lock_guard<mutex> lk(yolo_out_mtx); yolo_last_dets = dets; yolo_last_sc = stable_sc; }
-        // GHÌM: nghỉ giữa 2 lần suy luận -> nhường CPU cho vòng bám làn (khỏi giật/ngáo)
+
+        cnt++;
+        auto now = chrono::steady_clock::now();
+        chrono::duration<float> dt = now - t0;
+        if (dt.count() >= 1.0f) { g_fps_yolo.store(cnt / dt.count(), memory_order_relaxed); cnt = 0; t0 = now; }
+
         this_thread::sleep_for(chrono::milliseconds(120));
     }
 }
@@ -545,6 +610,7 @@ void yolo_thread_func() {
 // ============================================================
 int main(int argc, char** argv) {
     if (argc > 1) YOLO_MODEL_PATH = argv[1];
+    string log_path = (argc > 2) ? argv[2] : default_log_name();
     cout << "=============================================\n"
          << "  LANE FOLLOW + YOLO                          \n"
          << "=============================================\n"
@@ -558,8 +624,20 @@ int main(int argc, char** argv) {
     for (auto p : ports) if (init_uart(p)) { cout << "[UART] " << p << " @115200\n"; uart_ok = true; break; }
     if (!uart_ok) { cerr << "[UART] Lỗi cổng!\n"; return 1; }
 
-    setNumThreads(2);             // chặn OpenCV/YOLO ăn hết 4 nhân -> chừa nhân cho vòng bám làn (đỡ ngáo)
-    init_yolo(YOLO_MODEL_PATH);   // hỏng thì vẫn chạy bám làn
+    setNumThreads(2);             
+    init_yolo(YOLO_MODEL_PATH);  
+
+    g_program_start = chrono::steady_clock::now();
+    g_log.open(log_path, ios::out);
+    if (g_log.is_open()) {
+        g_log << "frame,t_ms,fps_vision,fps_capture,fps_yolo,latency_compute_ms,"
+                 "lane_found,off,nbands,steer,spd,no_lane,scenario,force_stop,on_zebra,"
+                 "enc_left,enc_right,enc_t_ms\n";
+        g_log.flush();
+        cout << "[LOG] Ghi số liệu vào: " << log_path << "\n";
+    } else {
+        cerr << "[LOG] Không mở được file log (" << log_path << ") — vẫn chạy bình thường, chỉ không lưu số liệu.\n";
+    }
 
     termios oldt; tcgetattr(STDIN_FILENO, &oldt);
     { termios n = oldt; n.c_lflag &= ~(ICANON | ECHO); n.c_cc[VMIN] = 0; n.c_cc[VTIME] = 0;
@@ -567,6 +645,7 @@ int main(int argc, char** argv) {
 
     thread t_cap(capture_thread_func);
     thread t_uart(uart_thread_func);
+    thread t_uart_rx(uart_rx_thread_func);
     thread t_mjpeg(mjpeg_server_thread);
     thread t_yolo(yolo_thread_func);
 
@@ -575,9 +654,8 @@ int main(int argc, char** argv) {
     float fps = 0.0f;
     auto  fps_t0 = chrono::steady_clock::now();
 
-    // CHỐT dừng đèn đỏ
     bool  red_latched = false;
-    bool  stopped_at_line = false;   // đã tới vạch người đi bộ và dừng hẳn
+    bool  stopped_at_line = false;   
     auto  red_release_at = chrono::steady_clock::now();
 
     while (!app_exit) {
@@ -586,11 +664,10 @@ int main(int argc, char** argv) {
         else if (ch == 's') { shared_running = false; shared_steer = 0; shared_speed = 0; smooth_steer = 0; printf("\n>>> DỪNG\n"); }
         else if (ch == 'q') { app_exit = true; break; }
 
-        Mat frame;
-        { lock_guard<mutex> lk(cap_mtx); if (cap_ready) cap_frame.copyTo(frame); }
+        Mat frame; int64_t frame_cap_us = 0;
+        { lock_guard<mutex> lk(cap_mtx); if (cap_ready) { cap_frame.copyTo(frame); frame_cap_us = cap_frame_us; } }
         if (frame.empty()) { this_thread::sleep_for(chrono::milliseconds(5)); continue; }
 
-        // Gửi khung mới nhất cho YOLO (không chặn)
         { lock_guard<mutex> lk(yolo_in_mtx); frame.copyTo(yolo_input_frame); yolo_in_ready = true; }
         yolo_in_cv.notify_one();
 
@@ -598,7 +675,6 @@ int main(int argc, char** argv) {
         Mat dbg;
         LaneResult lane = detect_lane(frame, mask, dbg);
 
-        // --- LÁI: luôn bám làn (kể cả lúc sắp dừng) ---
         static int last_good_steer = 0;
         int raw_steer;
         if (lane.found) { raw_steer = offset_to_steer(lane.offset); last_good_steer = raw_steer; }
@@ -607,10 +683,12 @@ int main(int argc, char** argv) {
         int steer_val = (int)roundf(smooth_steer);
 
         if (lane.found) no_lane = 0; else no_lane++;
-        int spd = lane.found ? DRIVE_SPEED : SLOW_SPEED;
+        int spd;
+        if (!lane.found)                                            spd = SLOW_SPEED;
+        else if (ENABLE_CURVE_SPEED && fabsf(lane.curve) > CURVE_TH) spd = CURVE_SPEED;  
+        else                                                        spd = DRIVE_SPEED;
         if (no_lane > NO_LANE_STOP) { spd = 0; last_good_steer = 0; }
 
-        // --- VẠCH NGƯỜI ĐI BỘ: sọc trắng ngang làm bám-làn loạn -> ĐI THẲNG, bò chậm qua ---
         bool zebra_raw = detect_zebra(mask);
         static int zebra_confirm = 0, zebra_hold = 0;
         if (zebra_raw) zebra_confirm++; else zebra_confirm = 0;
@@ -618,12 +696,11 @@ int main(int argc, char** argv) {
         bool on_zebra = ENABLE_ZEBRA && zebra_hold > 0;
         if (zebra_hold > 0) zebra_hold--;
         if (on_zebra) {
-            steer_val = 0;          // GIỮ THẲNG -> hết lạng lách trên vạch
+            steer_val = 0;         
             last_good_steer = 0;
-            spd = ZEBRA_SPEED;      // bò chậm qua vạch
+            spd = ZEBRA_SPEED;      
         }
 
-        // --- Lấy kết quả YOLO mới nhất + áp KỊCH BẢN ---
         Scenario sc; vector<YoloDetection> dets;
         { lock_guard<mutex> lk(yolo_out_mtx); sc = yolo_last_sc; dets = yolo_last_dets; }
 
@@ -633,20 +710,18 @@ int main(int argc, char** argv) {
             case Scenario::NO_ENTRY:
             case Scenario::PERSON_AHEAD:
             case Scenario::STOP_SIGN:
-                force_stop = true; break;                 // DỪNG khi còn THẤY; cất đi thì chạy lại
+                force_stop = true; break;                
             case Scenario::RED_LIGHT:
-                if (!red_latched) {                       // CHỐT: thấy đỏ -> dừng và GIỮ luôn
+                if (!red_latched) {                       
                     red_latched = true;
                     red_release_at = now2 + chrono::milliseconds(RED_LATCH_TIMEOUT_MS);
                 }
                 break;
             default: break;
         }
-        // Đèn đỏ đã chốt -> VẪN bám làn tiến tới, gặp VẠCH NGƯỜI ĐI BỘ thì DỪNG hẳn tại vạch.
-        // (Dừng theo vạch kẻ đường - camera nhìn rõ - thay vì canh theo kích thước đèn.)
-        // Đèn trôi khỏi khung cũng không sao vì đã chốt. Nhả khi thấy XANH hoặc hết thời gian.
+        
         if (red_latched) {
-            force_stop = true;                         // thấy đỏ -> DỪNG NGAY và giữ (dừng từ xa cũng được)
+            force_stop = true;                         
             if (sc == Scenario::GREEN_LIGHT || now2 >= red_release_at) {
                 red_latched = false; stopped_at_line = false;
             }
@@ -656,14 +731,14 @@ int main(int argc, char** argv) {
         shared_steer.store(steer_val, memory_order_relaxed);
         shared_speed.store(shared_running.load() ? spd : 0, memory_order_relaxed);
 
-        // --- Vẽ YOLO + nhãn kịch bản lên ảnh debug ---
+        float latency_compute_ms = (frame_cap_us > 0) ? (now_us() - frame_cap_us) / 1000.0f : 0.0f;
+
         draw_detections(dbg, dets);
         char sctag[48]; snprintf(sctag, sizeof(sctag), "%s%s", scenario_name(sc), force_stop ? " [STOP]" : "");
         putText(dbg, sctag, Point(5, 18), FONT_HERSHEY_SIMPLEX, 0.55,
                 force_stop ? Scalar(0,0,255) : Scalar(0,200,0), 2);
         if (on_zebra) putText(dbg, "ZEBRA -> di thang", Point(5, 38),
                               FONT_HERSHEY_SIMPLEX, 0.55, Scalar(0,140,255), 2);
-        // Kiểm tra: hiện "ZEBRA" mỗi khi detect_zebra bắt được vạch (dù chưa có đèn đỏ)
         if (zebra_raw)
             putText(dbg, "ZEBRA", Point(220, 18), FONT_HERSHEY_SIMPLEX, 0.55, Scalar(0,140,255), 2);
 
@@ -696,16 +771,34 @@ int main(int argc, char** argv) {
                lane.found ? "LANE" : "NOLN", fps,
                lane.found ? lane.offset : 0.0f, steer_val, spd, no_lane, scenario_name(sc), on_zebra ? 1 : 0);
         fflush(stdout);
+
+        if (g_log.is_open()) {
+            g_log_frame_idx++;
+            double t_ms = chrono::duration<double, milli>(chrono::steady_clock::now() - g_program_start).count();
+            string sc_name = scenario_name(sc);
+            while (!sc_name.empty() && sc_name.back() == ' ') sc_name.pop_back();  
+            g_log << g_log_frame_idx << ',' << fixed << setprecision(1) << t_ms << ','
+                  << setprecision(2) << fps << ',' << g_fps_capture.load(memory_order_relaxed) << ','
+                  << g_fps_yolo.load(memory_order_relaxed) << ',' << setprecision(2) << latency_compute_ms << ','
+                  << (lane.found ? 1 : 0) << ',' << setprecision(4) << (lane.found ? lane.offset : 0.0f) << ','
+                  << lane.nbands << ',' << steer_val << ',' << spd << ',' << no_lane << ','
+                  << sc_name << ',' << (force_stop ? 1 : 0) << ',' << (on_zebra ? 1 : 0) << ','
+                  << g_enc_left.load(memory_order_relaxed) << ',' << g_enc_right.load(memory_order_relaxed) << ','
+                  << g_enc_t_ms.load(memory_order_relaxed) << "\n";
+            if (g_log_frame_idx % 50 == 0) g_log.flush();   
+        }
     }
 
     app_exit = true;
     yolo_in_cv.notify_all();
     t_mjpeg.detach();
-    if (t_cap.joinable())  t_cap.join();
-    if (t_uart.joinable()) t_uart.join();
-    if (t_yolo.joinable()) t_yolo.join();
+    if (t_cap.joinable())     t_cap.join();
+    if (t_uart.joinable())    t_uart.join();
+    if (t_uart_rx.joinable()) t_uart_rx.join();
+    if (t_yolo.joinable())    t_yolo.join();
     tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
     if (uart_fd >= 0) { write(uart_fd, "S,0,0\n", 6); close(uart_fd); }
+    if (g_log.is_open()) { g_log.flush(); g_log.close(); cout << "\n[LOG] Đã ghi " << g_log_frame_idx << " dòng.\n"; }
     printf("\nĐã dừng an toàn.\n");
     return 0;
 }

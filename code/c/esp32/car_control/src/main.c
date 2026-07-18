@@ -48,6 +48,13 @@ static float Kp = 1.2f;
 static float Ki = 0.08f;
 
 // =============================================
+// XỬ LÝ NHIỄU ENCODER
+// =============================================
+#define ENC_DEBOUNCE_US    60
+#define ENC_DEAD_CONFIRM   3
+#define ENC_ALIVE_CONFIRM  2
+
+// =============================================
 // ENCODER — portMUX cho dual-core safe 
 // =============================================
 static portMUX_TYPE enc_mux = portMUX_INITIALIZER_UNLOCKED;
@@ -55,25 +62,40 @@ static portMUX_TYPE enc_mux = portMUX_INITIALIZER_UNLOCKED;
 volatile int32_t encLeftCount  = 0;   
 volatile int32_t encRightCount = 0;
 
+static volatile int64_t lastEdgeLA = 0, lastEdgeLB = 0;
+static volatile int64_t lastEdgeRA = 0, lastEdgeRB = 0;
+
 static void IRAM_ATTR isr_enc_l_a(void* arg) {
+    int64_t now = esp_timer_get_time();
+    if (now - lastEdgeLA < ENC_DEBOUNCE_US) return;   
+    lastEdgeLA = now;
     portENTER_CRITICAL_ISR(&enc_mux);
     if (gpio_get_level(ENC_L_A) == gpio_get_level(ENC_L_B)) encLeftCount++;
     else encLeftCount--;
     portEXIT_CRITICAL_ISR(&enc_mux);
 }
 static void IRAM_ATTR isr_enc_l_b(void* arg) {
+    int64_t now = esp_timer_get_time();
+    if (now - lastEdgeLB < ENC_DEBOUNCE_US) return;
+    lastEdgeLB = now;
     portENTER_CRITICAL_ISR(&enc_mux);
     if (gpio_get_level(ENC_L_A) != gpio_get_level(ENC_L_B)) encLeftCount++;
     else encLeftCount--;
     portEXIT_CRITICAL_ISR(&enc_mux);
 }
 static void IRAM_ATTR isr_enc_r_a(void* arg) {
+    int64_t now = esp_timer_get_time();
+    if (now - lastEdgeRA < ENC_DEBOUNCE_US) return;
+    lastEdgeRA = now;
     portENTER_CRITICAL_ISR(&enc_mux);
     if (gpio_get_level(ENC_R_A) == gpio_get_level(ENC_R_B)) encRightCount++;
     else encRightCount--;
     portEXIT_CRITICAL_ISR(&enc_mux);
 }
 static void IRAM_ATTR isr_enc_r_b(void* arg) {
+    int64_t now = esp_timer_get_time();
+    if (now - lastEdgeRB < ENC_DEBOUNCE_US) return;
+    lastEdgeRB = now;
     portENTER_CRITICAL_ISR(&enc_mux);
     if (gpio_get_level(ENC_R_A) != gpio_get_level(ENC_R_B)) encRightCount++;
     else encRightCount--;
@@ -91,6 +113,10 @@ static float integralLeft     = 0.0f;
 static float integralRight    = 0.0f;
 static int32_t prevEncLeft    = 0;
 static int32_t prevEncRight   = 0;
+
+static bool pidActiveLeft   = true, pidActiveRight   = true;
+static int  deadTicksLeft   = 0,    deadTicksRight   = 0;
+static int  aliveTicksLeft  = 0,    aliveTicksRight  = 0;
 
 static int currentServoAngle  = SERVO_CENTER;
 static int desiredServoAngle  = SERVO_CENTER;
@@ -211,6 +237,9 @@ void hard_stop(void) {
     targetSpeedLeft = targetSpeedRight = 0;
     pwmLeft = pwmRight = 0;
     integralLeft = integralRight = 0.0f;
+    pidActiveLeft = pidActiveRight = true;     // mỗi lần dừng -> lần chạy sau tin PID lại từ đầu
+    deadTicksLeft = deadTicksRight = 0;
+    aliveTicksLeft = aliveTicksRight = 0;
     portENTER_CRITICAL(&enc_mux);
     prevEncLeft  = encLeftCount;
     prevEncRight = encRightCount;
@@ -277,31 +306,50 @@ void control_task(void *pv) {
             int dirL = (targetSpeedLeft  > 0) ? 1 : -1;
             int dirR = (targetSpeedRight > 0) ? 1 : -1;
 
-            bool encDead = (deltaL == 0 && deltaR == 0);
-            if (encDead) {
-                int rawL_pwm = FF_BASE + abs(targetSpeedLeft)  * (255 - FF_BASE) / MAX_SPEED;
-                int rawR_pwm = FF_BASE + abs(targetSpeedRight) * (255 - FF_BASE) / MAX_SPEED;
-                pwmLeft  = (targetSpeedLeft  == 0) ? 0 : dirL * rawL_pwm;
-                pwmRight = (targetSpeedRight == 0) ? 0 : dirR * rawR_pwm;
+            // --- Cập nhật trạng thái sống/chết của encoder, TÁCH RIÊNG từng bánh ---
+            if (deltaL == 0) { deadTicksLeft++;  aliveTicksLeft  = 0; }
+            else              { aliveTicksLeft++; deadTicksLeft  = 0; }
+            if (deltaR == 0) { deadTicksRight++; aliveTicksRight = 0; }
+            else              { aliveTicksRight++; deadTicksRight = 0; }
+
+            if (pidActiveLeft   && deadTicksLeft   >= ENC_DEAD_CONFIRM)  pidActiveLeft  = false;
+            if (!pidActiveLeft  && aliveTicksLeft  >= ENC_ALIVE_CONFIRM) pidActiveLeft  = true;
+            if (pidActiveRight  && deadTicksRight  >= ENC_DEAD_CONFIRM)  pidActiveRight = false;
+            if (!pidActiveRight && aliveTicksRight >= ENC_ALIVE_CONFIRM) pidActiveRight = true;
+
+            int baseL = (targetSpeedLeft  != 0) ?
+                (FF_BASE + abs(targetSpeedLeft)  * (255 - FF_BASE) / MAX_SPEED) : 0;
+            int baseR = (targetSpeedRight != 0) ?
+                (FF_BASE + abs(targetSpeedRight) * (255 - FF_BASE) / MAX_SPEED) : 0;
+
+            if (pidActiveLeft) {
+                float errL = (float)targetSpeedLeft - (float)deltaL;
+                int   outL = dirL * baseL + (int)(Kp * errL + Ki * integralLeft);
+                bool  wouldWorsenSat = (outL > 255 && errL > 0) || (outL < -255 && errL < 0);
+                if (!wouldWorsenSat) {
+                    integralLeft += errL;
+                    if (integralLeft >  200.0f) integralLeft =  200.0f;
+                    if (integralLeft < -200.0f) integralLeft = -200.0f;
+                }
+                pwmLeft = dirL * baseL + (int)(Kp * errL + Ki * integralLeft);
             } else {
-                // PID bình thường
-                float errL = (float)targetSpeedLeft  - (float)deltaL;
+                integralLeft = 0.0f;
+                pwmLeft = (targetSpeedLeft == 0) ? 0 : dirL * baseL;
+            }
+
+            if (pidActiveRight) {
                 float errR = (float)targetSpeedRight - (float)deltaR;
-                integralLeft  += errL;
-                integralRight += errR;
-                // Anti-windup
-                if (integralLeft  >  200.0f) integralLeft  =  200.0f;
-                if (integralLeft  < -200.0f) integralLeft  = -200.0f;
-                if (integralRight >  200.0f) integralRight =  200.0f;
-                if (integralRight < -200.0f) integralRight = -200.0f;
-
-                int baseL = (targetSpeedLeft  != 0) ?
-                    (FF_BASE + abs(targetSpeedLeft)  * (255 - FF_BASE) / MAX_SPEED) : 0;
-                int baseR = (targetSpeedRight != 0) ?
-                    (FF_BASE + abs(targetSpeedRight) * (255 - FF_BASE) / MAX_SPEED) : 0;
-
-                pwmLeft  = dirL * baseL + (int)(Kp * errL + Ki * integralLeft);
+                int   outR = dirR * baseR + (int)(Kp * errR + Ki * integralRight);
+                bool  wouldWorsenSat = (outR > 255 && errR > 0) || (outR < -255 && errR < 0);
+                if (!wouldWorsenSat) {
+                    integralRight += errR;
+                    if (integralRight >  200.0f) integralRight =  200.0f;
+                    if (integralRight < -200.0f) integralRight = -200.0f;
+                }
                 pwmRight = dirR * baseR + (int)(Kp * errR + Ki * integralRight);
+            } else {
+                integralRight = 0.0f;
+                pwmRight = (targetSpeedRight == 0) ? 0 : dirR * baseR;
             }
 
             // Clamp
@@ -328,10 +376,13 @@ void control_task(void *pv) {
 // =============================================
 // TASK 2: UART RX — Core 0
 // =============================================
+#define TELEMETRY_PERIOD_US   100000    // 100ms ~ 10Hz
+
 void uart_task(void *pv) {
     uint8_t data[BUF_SIZE];
     char    line[128];
     int     line_len = 0;
+    int64_t lastTelemetryUs = 0;
 
     while (1) {
         int len = uart_read_bytes(UART_NUM, data, BUF_SIZE - 1, pdMS_TO_TICKS(10));
@@ -385,6 +436,20 @@ void uart_task(void *pv) {
                 line[line_len++] = c;
             }
         }
+
+        // --- Gửi telemetry encoder định kỳ về Pi  ---
+        int64_t nowUs = esp_timer_get_time();
+        if (nowUs - lastTelemetryUs >= TELEMETRY_PERIOD_US) {
+            lastTelemetryUs = nowUs;
+            int32_t eL, eR;
+            portENTER_CRITICAL(&enc_mux);
+            eL = encLeftCount; eR = encRightCount;
+            portEXIT_CRITICAL(&enc_mux);
+            char tbuf[64];
+            int  tn = snprintf(tbuf, sizeof(tbuf), "T,%ld,%ld,%lld\n",
+                                (long)eL, (long)eR, (long long)(nowUs / 1000));
+            uart_write_bytes(UART_NUM, tbuf, tn);
+        }
     }
 }
 
@@ -400,7 +465,7 @@ void app_main(void) {
     hardware_init();
     write_servo_angle(SERVO_CENTER);
 
-    // Core 0: UART (blocking-safe, không ảnh hưởng PID)
+    // Core 0: UART 
     xTaskCreatePinnedToCore(uart_task,    "uart_task",    4096, NULL,  5, NULL, 0);
     // Core 1: PID + Servo 50Hz — ưu tiên cao nhất
     xTaskCreatePinnedToCore(control_task, "control_task", 4096, NULL, 10, NULL, 1);
